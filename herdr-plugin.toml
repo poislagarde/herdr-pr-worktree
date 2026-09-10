@@ -1,6 +1,6 @@
 id = "poislagarde.pr-worktree"
 name = "PR Worktree"
-version = "0.1.0"
+version = "0.1.1"
 min_herdr_version = "0.9.0"
 description = "Open a GitHub pull request in a worktree beneath its repository's Herdr space."
 platforms = ["linux", "macos"]

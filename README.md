@@ -11,7 +11,7 @@ macOS or Linux. No Python packages or build step are needed.
 ## Install
 
 ```sh
-herdr plugin install poislagarde/herdr-pr-worktree --ref v0.1.0
+herdr plugin install poislagarde/herdr-pr-worktree --ref v0.1.1
 gh auth status
 ```
 
@@ -89,7 +89,7 @@ Unlink a development checkout before switching to a GitHub installation:
 
 ```sh
 herdr plugin unlink poislagarde.pr-worktree
-herdr plugin install poislagarde/herdr-pr-worktree --ref v0.1.0
+herdr plugin install poislagarde/herdr-pr-worktree --ref v0.1.1
 ```
 
 ## Remove

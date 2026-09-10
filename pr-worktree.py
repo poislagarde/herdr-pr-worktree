@@ -194,7 +194,6 @@ def main():
     try:
         url = args.url
         if interactive:
-            print("New worktree from GitHub PR\n")
             print("Paste a PR URL. Leave empty or press Ctrl+C to cancel.\n")
             url = input("PR URL: ").strip()
         if not url:
