@@ -1,0 +1,20 @@
+id = "poislagarde.pr-worktree"
+name = "PR Worktree"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Open a GitHub pull request in a worktree beneath its repository's Herdr space."
+platforms = ["linux", "macos"]
+
+[[actions]]
+id = "open"
+title = "New worktree from GitHub PR"
+contexts = ["global", "workspace"]
+command = ["python3", "plugin.py"]
+
+[[panes]]
+id = "prompt"
+title = "New worktree from GitHub PR"
+placement = "popup"
+width = "85%"
+height = "60%"
+command = ["python3", "pr-worktree.py"]
