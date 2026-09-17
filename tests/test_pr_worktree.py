@@ -112,15 +112,19 @@ class CheckoutTests(unittest.TestCase):
                 workspace = args[args.index("--workspace") + 1]
                 return self.result(args, {"result": {"panes": self.panes.get(workspace, [])}})
             self.assertEqual(args[1], "worktree")
-            self.assertEqual(Path(args[args.index("--cwd") + 1]).resolve(), self.root.resolve())
             operation = args[2]
+            source = Path(args[args.index("--cwd") + 1]).resolve()
             if operation == "list":
+                self.assertIn(source, [Path(tree["worktree"]).resolve()
+                                       for tree in self.registered_worktrees()])
                 trees = [{"path": tree["worktree"],
                           "branch": tree.get("branch", "").removeprefix("refs/heads/"),
                           "is_prunable": "prunable" in tree,
                           "is_locked": "locked" in tree}
                          for tree in self.registered_worktrees()]
-                return self.result(args, {"result": {"worktrees": trees}})
+                return self.result(args, {"result": {"worktrees": trees,
+                    "source": {"source_checkout_path": str(self.root)}}})
+            self.assertEqual(source, self.root.resolve())
             if operation == "create":
                 branch = args[args.index("--branch") + 1]
                 sha = args[args.index("--base") + 1]
@@ -140,8 +144,10 @@ class CheckoutTests(unittest.TestCase):
                 "workspace_id": "test:w2", "cwd": str(self.checkout)},
                 "worktree": {"path": str(self.checkout)}}})
         if args[:3] == ("git", "remote", "get-url"):
-            if Path(cwd).resolve() in (self.root.resolve(), self.checkout.resolve()):
+            actual = self.real_run(*args, cwd=cwd, check=check, **kwargs)
+            if actual.stdout.strip() == str(self.remote):
                 return subprocess.CompletedProcess(args, 0, self.remote_urls[args[-1]] + "\n", "")
+            return actual
         return self.real_run(*args, cwd=cwd, check=check, **kwargs)
 
     def open_pr(self, url="https://github.com/example/project/pull/4105", cwd=None):
@@ -156,7 +162,7 @@ class CheckoutTests(unittest.TestCase):
         return unrelated
 
     def matching_workspace(self, workspace_id="test:matching"):
-        return {"workspace_id": workspace_id, "label": "Darwin", "worktree": {
+        return {"workspace_id": workspace_id, "label": "Project", "worktree": {
             "repo_root": str(self.root), "checkout_path": str(self.root)}}
 
     def assert_private_refs_removed(self):
@@ -198,6 +204,38 @@ class CheckoutTests(unittest.TestCase):
                          self.pr_sha)
         self.assertNotEqual(self.git("show-ref", "--verify", "refs/heads/" + self.branch,
                                      cwd=self.remote, check=False).returncode, 0)
+        self.assert_private_refs_removed()
+
+    def test_linked_invoking_checkout_creates_sibling_from_parent(self):
+        source = self.directory / "invoking worktree"
+        self.git("worktree", "add", "-b", "feature/other-work", str(source), self.base_sha)
+        (source / "tracked.txt").write_text("keep invoking work\n")
+        self.open_pr(cwd=source)
+        listing = next(call for call in self.calls
+                       if call[:3] == ("test-herdr", "worktree", "list"))
+        self.assertEqual(Path(listing[listing.index("--cwd") + 1]).resolve(), source.resolve())
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.checkout).stdout.strip(),
+                         self.pr_sha)
+        self.assertEqual((source / "tracked.txt").read_text(), "keep invoking work\n")
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=source).stdout.strip(), self.base_sha)
+        self.assertEqual(len(self.registered_worktrees()), 3)
+        self.assert_private_refs_removed()
+
+    def test_linked_invoking_checkout_reopens_itself_with_local_work_intact(self):
+        self.git("worktree", "add", "-b", self.branch, str(self.checkout), self.pr_sha)
+        (self.checkout / "tracked.txt").write_text("committed local progress\n")
+        self.git("commit", "-am", "local progress", cwd=self.checkout)
+        local_sha = self.git("rev-parse", "HEAD", cwd=self.checkout).stdout.strip()
+        (self.checkout / "tracked.txt").write_text("uncommitted local progress\n")
+        (self.checkout / "untracked.txt").write_text("preserve me\n")
+        before = self.git("status", "--porcelain", cwd=self.checkout).stdout
+        self.open_pr(cwd=self.checkout)
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.checkout).stdout.strip(), local_sha)
+        self.assertEqual(self.git("status", "--porcelain", cwd=self.checkout).stdout, before)
+        self.assertEqual((self.checkout / "tracked.txt").read_text(), "uncommitted local progress\n")
+        self.assertEqual((self.checkout / "untracked.txt").read_text(), "preserve me\n")
+        self.assertFalse(any(call[:2] == ("git", "fetch") for call in self.calls))
+        self.assertEqual(len(self.registered_worktrees()), 2)
         self.assert_private_refs_removed()
 
     def test_matching_upstream_remote_is_used(self):

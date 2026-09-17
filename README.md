@@ -46,6 +46,8 @@ pane directories in the same Herdr session. The first matching open repository
 is used. A checkout must have an HTTPS or SSH remote for `github.com` matching
 the URL's owner and repository. Open the repository in a space before invoking
 the action if it is not already available.
+When invoked from a linked worktree, new and existing PR worktrees open beneath
+the repository's parent space.
 
 - An existing local worktree on the PR branch is opened as-is. The plugin does
   not fetch, reset, or change its files or commits.
