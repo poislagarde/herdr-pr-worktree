@@ -136,6 +136,8 @@ def open_pr(url, cwd, focus=True):
     root, remote = find_repository(repository, cwd, herdr)
     # Validate the server and repository before fetching anything.
     listing = json.loads(run(herdr, "worktree", "list", "--cwd", root).stdout)["result"]
+    # Listing accepts linked checkouts; create/open require their parent checkout.
+    source_root = listing["source"]["source_checkout_path"]
     canonical = f"https://github.com/{repository}/pull/{number}"
     print(f"Looking up {canonical} …", flush=True)
     pr = json.loads(run("gh", "api", "--hostname", "github.com",
@@ -154,7 +156,7 @@ def open_pr(url, cwd, focus=True):
         if existing.get("is_prunable") or not Path(existing["path"]).is_dir():
             raise WorktreeError(f"The checkout for '{branch}' is missing: {existing['path']}. "
                                 "Repair its worktree registration, then retry.")
-        response = run(herdr, "worktree", "open", "--cwd", root,
+        response = run(herdr, "worktree", "open", "--cwd", source_root,
                        "--path", existing["path"], focus_flag)
         report_opened(response, branch)
         return
@@ -175,7 +177,7 @@ def open_pr(url, cwd, focus=True):
         if local is not None and local != sha:
             raise WorktreeError(f"Local branch '{branch}' has different commits from PR #{number}. "
                                 "Update or rename it, then retry. It has been left unchanged.")
-        response = run(herdr, "worktree", "create", "--cwd", root,
+        response = run(herdr, "worktree", "create", "--cwd", source_root,
                        "--branch", branch, "--base", sha, focus_flag)
         report_opened(response, branch, sha)
     finally:

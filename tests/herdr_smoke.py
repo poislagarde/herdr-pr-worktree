@@ -182,6 +182,7 @@ class Fixture:
         metadata = {"head": {"ref": branch, "sha": self.sha},
                     "base": {"repo": {"full_name": "example/repo"}}}
         original_run = helper.run
+        fetches = []
         def fixture_run(*args, **kwargs):
             if args[:3] == ("git", "remote", "get-url"):
                 actual = original_run(*args, **kwargs)
@@ -190,6 +191,8 @@ class Fixture:
                 return actual
             if args[:2] == ("gh", "api"):
                 return subprocess.CompletedProcess(args, 0, json.dumps(metadata), "")
+            if args[:2] == ("git", "fetch"):
+                fetches.append(args)
             return original_run(*args, **kwargs)
         helper.run = fixture_run
         with patch.dict(os.environ, self.env, clear=True):
@@ -211,20 +214,54 @@ class Fixture:
             child = next(w for w in spaces if (w.get("worktree") or {}).get("checkout_path") == str(path))
             assert child["worktree"]["repo_key"] == parent["worktree"]["repo_key"]
             assert child["worktree"]["is_linked_worktree"] and not child["focused"]
+            self.api("workspace", "focus", child["workspace_id"])
+            sibling_branch = "feature/sibling-pr-fixture"
+            self.git_run("update-ref", "refs/pull/4106/head", self.sha, cwd=self.remote)
+            metadata["head"]["ref"] = sibling_branch
+            helper.open_pr("https://github.com/example/repo/pull/4106", str(path), focus=False)
+            listed = self.api("worktree", "list", "--cwd", str(self.repo))["worktrees"]
+            matching = [tree for tree in listed if tree["branch"] == sibling_branch]
+            assert len(matching) == 1, matching
+            sibling_path = Path(matching[0]["path"])
+            spaces = self.api("workspace", "list")["workspaces"]
+            sibling = next(w for w in spaces
+                           if (w.get("worktree") or {}).get("checkout_path") == str(sibling_path))
+            assert sibling_path.is_relative_to(self.root)
+            assert sibling["worktree"]["repo_key"] == parent["worktree"]["repo_key"]
+            assert sibling["worktree"]["is_linked_worktree"] and not sibling["focused"]
+            assert self.git_run("rev-parse", "HEAD", cwd=sibling_path) == self.sha
+            assert self.git_run("symbolic-ref", "--short", "HEAD", cwd=sibling_path) == sibling_branch
+            assert self.api("api", "snapshot")["snapshot"]["focused_workspace_id"] == child["workspace_id"]
+            metadata["head"]["ref"] = branch
             advanced = self.git_run("commit-tree", self.tree, "-p", self.sha, "-m", "local change", cwd=path)
             self.git_run("update-ref", "refs/heads/" + branch, advanced, cwd=path)
             (path / "file.txt").write_text("local dirty work\n")
             dirty = self.git_run("status", "--porcelain", cwd=path)
-            helper.open_pr("https://github.com/example/repo/pull/4105", str(self.non_git), focus=False)
-            assert self.git_run("rev-parse", "HEAD", cwd=path) == advanced
-            assert (path / "file.txt").read_text() == "local dirty work\n"
-            assert self.git_run("status", "--porcelain", cwd=path) == dirty
-            assert [w["workspace_id"] for w in self.api("workspace", "list")["workspaces"]] == [w["workspace_id"] for w in spaces]
-            assert len(self.api("worktree", "list", "--cwd", str(self.repo))["worktrees"]) == len(listed)
+            unrelated_child = self.api("worktree", "create", "--cwd", str(self.unrelated),
+                                       "--branch", "feature/unrelated-fixture", "--base", "main",
+                                       "--no-focus")
+            unrelated_path = Path(unrelated_child["worktree"]["path"])
+            assert unrelated_path.is_relative_to(self.root)
+            spaces = self.api("workspace", "list")["workspaces"]
+            listed = self.api("worktree", "list", "--cwd", str(self.repo))["worktrees"]
+            fetch_count = len(fetches)
+            for invoking_path, focused_workspace in (
+                    (path, child["workspace_id"]),
+                    (self.non_git, child["workspace_id"]),
+                    (unrelated_path, unrelated_child["workspace"]["workspace_id"])):
+                self.api("workspace", "focus", focused_workspace)
+                helper.open_pr("https://github.com/example/repo/pull/4105", str(invoking_path), focus=False)
+                assert self.git_run("rev-parse", "HEAD", cwd=path) == advanced
+                assert (path / "file.txt").read_text() == "local dirty work\n"
+                assert self.git_run("status", "--porcelain", cwd=path) == dirty
+                assert [w["workspace_id"] for w in self.api("workspace", "list")["workspaces"]] == [w["workspace_id"] for w in spaces]
+                assert len(self.api("worktree", "list", "--cwd", str(self.repo))["worktrees"]) == len(listed)
+                assert self.api("api", "snapshot")["snapshot"]["focused_workspace_id"] == focused_workspace
+                assert len(fetches) == fetch_count
             assert self.git_run("rev-parse", "HEAD") == self.base
             assert not self.git_run("status", "--porcelain")
             assert not self.git_run("for-each-ref", "refs/herdr/pr-worktree")
-        print("PASS: cross-space discovery, exact branch/SHA, correct group, dirty existing checkout reuse")
+        print("PASS: cross-space discovery, linked-source create, correct group, dirty linked checkout reuse")
 
     def stop(self):
         if self.process.poll() is None:
