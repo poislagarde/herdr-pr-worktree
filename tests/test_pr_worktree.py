@@ -170,6 +170,28 @@ class CheckoutTests(unittest.TestCase):
                         "refs/herdr/pr-worktree/").stdout
         self.assertEqual(refs, "")
 
+    def recovery_checkout(self, path=None, branch=None):
+        path = path or self.directory / "expired temporary checkout"
+        self.git("worktree", "add", "-b", branch or self.branch, str(path), self.pr_sha)
+        admin = Path(self.git("rev-parse", "--absolute-git-dir", cwd=path).stdout.strip())
+        return path, admin
+
+    def assert_recovery_refused(self, path, admin, sha=None):
+        with self.assertRaises(HELPER.WorktreeError):
+            self.open_pr()
+        self.assertTrue(admin.is_dir())
+        self.assertEqual(self.git("rev-parse", "refs/heads/" + self.branch).stdout.strip(),
+                         sha or self.pr_sha)
+        self.assertIn(str(path.parent.resolve() / path.name),
+                      [tree["worktree"] for tree in self.registered_worktrees()])
+        self.assertFalse(self.checkout.exists())
+        self.assertFalse(any(call[:3] in (("git", "worktree", "remove"),
+                                        ("git", "worktree", "prune"),
+                                        ("test-herdr", "worktree", "create"),
+                                        ("test-herdr", "worktree", "open"))
+                             for call in self.calls))
+        self.assert_private_refs_removed()
+
     def assert_no_checkout_created(self):
         self.assertFalse(self.checkout.exists())
         self.assertEqual(len(self.registered_worktrees()), 1)
@@ -387,16 +409,195 @@ class CheckoutTests(unittest.TestCase):
         self.assertFalse(any(call[:2] == ("git", "fetch") for call in self.calls))
         self.assertEqual(len(self.registered_worktrees()), 2)
 
-    def test_missing_registered_checkout_is_not_replaced(self):
-        self.git("worktree", "add", "-b", self.branch, str(self.checkout), self.pr_sha)
-        shutil.rmtree(self.checkout)
-        with self.assertRaises(HELPER.WorktreeError):
-            self.open_pr()
+    def test_missing_registered_checkout_is_recovered_without_pruning_other_worktrees(self):
+        missing, admin = self.recovery_checkout()
+        before = {str(path.relative_to(admin)): path.read_bytes()
+                  for path in admin.rglob("*") if path.is_file()}
+        unrelated, unrelated_admin = self.recovery_checkout(
+            self.directory / "another expired checkout", "feature/unrelated")
+        unrelated_before = {str(path.relative_to(unrelated_admin)): path.read_bytes()
+                            for path in unrelated_admin.rglob("*") if path.is_file()}
+        shutil.rmtree(missing)
+        shutil.rmtree(unrelated)
+        (self.root / "tracked.txt").write_text("preserve the source checkout\n")
+
+        self.open_pr()
+
+        self.assertFalse(missing.exists())
+        self.assertFalse(admin.exists())
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.checkout).stdout.strip(),
+                         self.pr_sha)
+        self.assertEqual(self.git("symbolic-ref", "--short", "HEAD",
+                                  cwd=self.checkout).stdout.strip(), self.branch)
+        self.assertEqual((self.root / "tracked.txt").read_text(),
+                         "preserve the source checkout\n")
+        self.assertEqual(len(self.registered_worktrees()), 3)
+        self.assertEqual({str(path.relative_to(unrelated_admin)): path.read_bytes()
+                          for path in unrelated_admin.rglob("*") if path.is_file()},
+                         unrelated_before)
+        backups = list((self.root / ".git" / "herdr-pr-worktree-recovery").iterdir())
+        self.assertEqual(len(backups), 1)
+        self.assertEqual({str(path.relative_to(backups[0])): path.read_bytes()
+                          for path in backups[0].rglob("*") if path.is_file()}, before)
+        removals = [call for call in self.calls if call[:3] == ("git", "worktree", "remove")]
+        self.assertEqual(removals, [("git", "worktree", "remove", "--", str(missing.resolve()))])
+        self.assertFalse(any(call[:3] == ("git", "worktree", "prune") for call in self.calls))
+        self.assert_private_refs_removed()
+
+    def test_missing_checkout_with_staged_changes_preserves_its_index(self):
+        missing, admin = self.recovery_checkout()
+        (missing / "tracked.txt").write_text("staged work that is only in the index\n")
+        self.git("add", "tracked.txt", cwd=missing)
+        index = (admin / "index").read_bytes()
+        shutil.rmtree(missing)
+
+        self.assert_recovery_refused(missing, admin)
+
+        self.assertEqual((admin / "index").read_bytes(), index)
+        self.assertEqual(self.git("--git-dir", str(admin), "show", ":tracked.txt").stdout,
+                         "staged work that is only in the index\n")
+
+    def test_missing_checkout_with_ignored_staged_submodule_change_is_preserved(self):
+        missing, admin = self.recovery_checkout()
+        staged_commit = self.pr_sha
+        self.git("update-index", "--add", "--cacheinfo",
+                 "160000," + self.base_sha + ",submodule", cwd=missing)
+        self.git("commit", "-m", "add submodule pointer", cwd=missing)
+        self.pr_sha = self.git("rev-parse", "HEAD", cwd=missing).stdout.strip()
+        self.metadata["head"]["sha"] = self.pr_sha
+        self.git("push", "origin", "HEAD:refs/pull/4105/head", cwd=missing)
+        self.git("update-index", "--cacheinfo", "160000," + staged_commit + ",submodule",
+                 cwd=missing)
+        self.git("config", "diff.ignoreSubmodules", "all")
+        index = (admin / "index").read_bytes()
+        self.assertEqual(self.git("diff", "--cached", "--quiet", "HEAD", "--",
+                                  cwd=missing, check=False).returncode, 0)
+        shutil.rmtree(missing)
+
+        self.assert_recovery_refused(missing, admin)
+
+        self.assertEqual((admin / "index").read_bytes(), index)
+        self.assertIn(staged_commit, self.git("--git-dir", str(admin), "ls-files",
+                                              "--stage", "--", "submodule").stdout)
+
+    def test_missing_checkout_with_unmerged_index_preserves_conflict_stages(self):
+        missing, admin = self.recovery_checkout()
+        # Insert actual conflict stages without depending on merge conflict heuristics.
+        base_blob = self.git("rev-parse", self.base_sha + ":tracked.txt").stdout.strip()
+        pr_blob = self.git("rev-parse", self.pr_sha + ":tracked.txt").stdout.strip()
+        records = ("0 " + "0" * 40 + "\ttracked.txt\n"
+                   + f"100644 {base_blob} 1\ttracked.txt\n"
+                   + f"100644 {pr_blob} 2\ttracked.txt\n"
+                   + f"100644 {base_blob} 3\ttracked.txt\n")
+        subprocess.run(["git", "update-index", "--index-info"], cwd=missing,
+                       env=self.git_environment, input=records, text=True,
+                       capture_output=True, check=True)
+        stages = self.git("ls-files", "--unmerged", cwd=missing).stdout
+        self.assertTrue(stages)
+        shutil.rmtree(missing)
+
+        self.assert_recovery_refused(missing, admin)
+
+        self.assertEqual(self.git("--git-dir", str(admin), "ls-files", "--unmerged").stdout,
+                         stages)
+
+    def test_missing_locked_checkout_is_preserved_without_lock_reason(self):
+        missing, admin = self.recovery_checkout()
+        self.git("worktree", "lock", str(missing))
+        shutil.rmtree(missing)
+        self.assertEqual((admin / "locked").read_text(), "")
+        self.assert_recovery_refused(missing, admin)
+        self.assertTrue((admin / "locked").exists())
+
+    def test_missing_checkout_with_operation_or_lock_metadata_is_preserved(self):
+        missing, admin = self.recovery_checkout()
+        shutil.rmtree(missing)
+        for name in ("index.lock", "HEAD.lock", "MERGE_HEAD", "CHERRY_PICK_HEAD",
+                     "REVERT_HEAD", "rebase-merge", "rebase-apply", "sequencer", "BISECT_START"):
+            with self.subTest(name=name):
+                marker = admin / name
+                marker.write_text(self.pr_sha + "\n")
+                self.calls.clear()
+                self.assert_recovery_refused(missing, admin)
+                self.assertEqual(marker.read_text(), self.pr_sha + "\n")
+                marker.unlink()
+
+    def test_missing_checkout_with_absent_index_is_preserved(self):
+        missing, admin = self.recovery_checkout()
+        (admin / "index").unlink()
+        shutil.rmtree(missing)
+        self.assert_recovery_refused(missing, admin)
+
+    def test_registered_path_occupied_by_file_or_symlink_is_preserved(self):
+        missing, admin = self.recovery_checkout()
+        shutil.rmtree(missing)
+        for kind in ("file", "dangling symlink"):
+            with self.subTest(kind=kind):
+                if kind == "file":
+                    missing.write_text("unrelated replacement file\n")
+                else:
+                    missing.symlink_to(self.directory / "absent symlink target")
+                self.calls.clear()
+                self.assert_recovery_refused(missing, admin)
+                if kind == "file":
+                    self.assertEqual(missing.read_text(), "unrelated replacement file\n")
+                else:
+                    self.assertTrue(missing.is_symlink())
+                missing.unlink()
+
+    def test_registered_directory_without_git_metadata_is_preserved(self):
+        missing, admin = self.recovery_checkout()
+        (missing / ".git").unlink()
+        (missing / "untracked.txt").write_text("preserve this directory\n")
+        self.assert_recovery_refused(missing, admin)
+        self.assertEqual((missing / "untracked.txt").read_text(), "preserve this directory\n")
+
+    def test_missing_checkout_below_absent_parent_is_preserved(self):
+        parent = self.directory / "offline parent"
+        parent.mkdir()
+        missing, admin = self.recovery_checkout(parent / "checkout")
+        shutil.rmtree(parent)
+        self.assert_recovery_refused(missing, admin)
+
+    def test_missing_checkout_with_different_local_commits_is_preserved(self):
+        missing, admin = self.recovery_checkout()
+        (missing / "tracked.txt").write_text("local committed progress\n")
+        self.git("commit", "-am", "local progress", cwd=missing)
+        local_sha = self.git("rev-parse", "HEAD", cwd=missing).stdout.strip()
+        shutil.rmtree(missing)
+        self.assert_recovery_refused(missing, admin, sha=local_sha)
+
+    def test_missing_checkout_is_preserved_when_fetch_fails(self):
+        missing, admin = self.recovery_checkout()
+        shutil.rmtree(missing)
+        self.git("update-ref", "-d", "refs/pull/4105/head", cwd=self.remote)
+        self.assert_recovery_refused(missing, admin)
+
+    def test_recovery_creation_failure_retains_branch_and_metadata_backup(self):
+        missing, admin = self.recovery_checkout()
+        index = (admin / "index").read_bytes()
+        shutil.rmtree(missing)
+        dispatch = self.dispatch
+
+        def fail_creation(*args, **kwargs):
+            if args[:3] == ("test-herdr", "worktree", "create"):
+                self.calls.append(args)
+                raise HELPER.WorktreeError("creation failed")
+            return dispatch(*args, **kwargs)
+
+        with mock.patch.object(HELPER, "run", side_effect=fail_creation):
+            with self.assertRaisesRegex(HELPER.WorktreeError, "creation failed"):
+                self.open_pr()
+        self.assertFalse(missing.exists())
         self.assertFalse(self.checkout.exists())
-        self.assertEqual(len(self.registered_worktrees()), 2)
-        self.assertFalse(any(call[:3] in (("test-herdr", "worktree", "create"),
-                                        ("test-herdr", "worktree", "open"))
-                             for call in self.calls))
+        self.assertFalse(admin.exists())
+        self.assertEqual(len(self.registered_worktrees()), 1)
+        self.assertEqual(self.git("rev-parse", "refs/heads/" + self.branch).stdout.strip(),
+                         self.pr_sha)
+        backups = list((self.root / ".git" / "herdr-pr-worktree-recovery").iterdir())
+        self.assertEqual(len(backups), 1)
+        self.assertEqual((backups[0] / "index").read_bytes(), index)
+        self.assertEqual((backups[0] / "HEAD").read_text(), "ref: refs/heads/" + self.branch + "\n")
         self.assert_private_refs_removed()
 
     def test_shell_metacharacters_in_branch_name_remain_literal(self):
