@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 from urllib.parse import urlsplit
@@ -130,6 +131,78 @@ def invocation_cwd():
     return os.environ.get("HERDR_ACTIVE_PANE_CWD") or os.getcwd()
 
 
+def recover_missing_worktree(root, path, branch, sha):
+    """Remove only a confirmed stale registration, retaining its metadata."""
+    path = Path(path)
+    hint = (f"The checkout for '{branch}' needs repair: {path}. "
+            "If it moved, run git worktree repair at its new location; "
+            "if its disk is offline, reconnect it before retrying.")
+
+    def require_missing_path():
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            if path.parent.is_dir():
+                return
+        raise WorktreeError(hint)
+
+    require_missing_path()
+
+    def require_stale_registration():
+        trees = []
+        tree = {}
+        for field in run("git", "worktree", "list", "--porcelain", "-z", cwd=root).stdout.split("\0"):
+            if field:
+                key, _, value = field.partition(" ")
+                tree[key] = value
+            elif tree:
+                trees.append(tree)
+                tree = {}
+        matching = [entry for entry in trees if entry.get("worktree") == str(path)]
+        if (len(matching) != 1 or matching[0] is trees[0]
+                or matching[0].get("branch") != "refs/heads/" + branch
+                or matching[0].get("HEAD") != sha
+                or "locked" in matching[0] or "prunable" not in matching[0]):
+            raise WorktreeError(hint)
+
+    require_stale_registration()
+
+    common = Path(run("git", "rev-parse", "--path-format=absolute", "--git-common-dir",
+                      cwd=root).stdout.rstrip("\n"))
+    candidates = [entry for entry in (common / "worktrees").iterdir()
+                  if entry.is_dir() and (entry / "gitdir").is_file()
+                  and (entry / "gitdir").read_text().rstrip("\n") == str(path / ".git")]
+    if len(candidates) != 1:
+        raise WorktreeError(hint)
+    admin = candidates[0]
+
+    def require_clean_metadata():
+        # A deleted checkout may still have staged work or an interrupted operation.
+        if ((admin / "gitdir").read_text().rstrip("\n") != str(path / ".git")
+                or not (admin / "index").is_file() or any(admin.rglob("*.lock"))
+                or any((admin / name).exists() for name in (
+                    "locked", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD",
+                    "rebase-merge", "rebase-apply", "sequencer", "BISECT_START"))):
+            raise WorktreeError(hint + " Its Git metadata needs manual inspection.")
+        clean = run("git", "--git-dir", str(admin), "diff", "--cached", "--quiet",
+                    "--no-ext-diff", "--ignore-submodules=none", "HEAD", "--", cwd=root,
+                    check=False)
+        if clean.returncode:
+            raise WorktreeError(hint + " Its index may contain staged changes; it was preserved.")
+
+    require_clean_metadata()
+    backup = common / "herdr-pr-worktree-recovery" / uuid.uuid4().hex
+    backup.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(admin, backup)
+    print(f"Saved missing checkout metadata to {backup}", flush=True)
+    require_missing_path()
+    require_stale_registration()
+    require_clean_metadata()
+    # No force: Git must still enforce locks and reject a checkout that reappears dirty.
+    run("git", "worktree", "remove", "--", str(path), cwd=root)
+    print(f"Removed stale registration for {branch}; recreating its checkout …", flush=True)
+
+
 def open_pr(url, cwd, focus=True):
     repository, number = pr_url(url)
     herdr = os.environ.get("HERDR_BIN_PATH", "herdr")
@@ -152,10 +225,8 @@ def open_pr(url, cwd, focus=True):
     focus_flag = "--focus" if focus else "--no-focus"
     existing = next((tree for tree in listing["worktrees"]
                      if tree.get("branch") == branch), None)
-    if existing:
-        if existing.get("is_prunable") or not Path(existing["path"]).is_dir():
-            raise WorktreeError(f"The checkout for '{branch}' is missing: {existing['path']}. "
-                                "Repair its worktree registration, then retry.")
+    missing = existing and (existing.get("is_prunable") or not Path(existing["path"]).is_dir())
+    if existing and not missing:
         response = run(herdr, "worktree", "open", "--cwd", source_root,
                        "--path", existing["path"], focus_flag)
         report_opened(response, branch)
@@ -165,7 +236,8 @@ def open_pr(url, cwd, focus=True):
     fetch_ref = f"refs/herdr/pr-worktree/{uuid.uuid4().hex}"
     fetched = None
     try:
-        run("git", "fetch", "--no-tags", "--no-write-fetch-head", "--refmap=", "--", remote,
+        run("git", "fetch", "--no-tags", "--no-auto-maintenance", "--no-write-fetch-head",
+            "--refmap=", "--", remote,
             f"refs/pull/{number}/head:{fetch_ref}", cwd=root)
         fetched = run("git", "rev-parse", "--verify", fetch_ref, cwd=root).stdout.strip()
         if fetched != sha:
@@ -177,6 +249,8 @@ def open_pr(url, cwd, focus=True):
         if local is not None and local != sha:
             raise WorktreeError(f"Local branch '{branch}' has different commits from PR #{number}. "
                                 "Update or rename it, then retry. It has been left unchanged.")
+        if missing:
+            recover_missing_worktree(root, existing["path"], branch, sha)
         response = run(herdr, "worktree", "create", "--cwd", source_root,
                        "--branch", branch, "--base", sha, focus_flag)
         report_opened(response, branch, sha)

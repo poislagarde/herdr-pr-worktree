@@ -232,6 +232,39 @@ class Fixture:
             assert self.git_run("rev-parse", "HEAD", cwd=sibling_path) == self.sha
             assert self.git_run("symbolic-ref", "--short", "HEAD", cwd=sibling_path) == sibling_branch
             assert self.api("api", "snapshot")["snapshot"]["focused_workspace_id"] == child["workspace_id"]
+
+            recovered_branch = "feature/deleted-pr-fixture"
+            missing_path = self.root / "temporary-pr-checkout"
+            unrelated_missing_path = self.root / "unrelated-stale-checkout"
+            self.git_run("update-ref", "refs/pull/4107/head", self.sha, cwd=self.remote)
+            self.git_run("worktree", "add", "-b", recovered_branch, missing_path, self.sha)
+            self.git_run("worktree", "add", "-b", "feature/unrelated-stale-fixture",
+                         unrelated_missing_path, self.base)
+            shutil.rmtree(missing_path)
+            shutil.rmtree(unrelated_missing_path)
+            registrations = self.git_run("worktree", "list", "--porcelain")
+            assert "worktree " + str(missing_path) + "\n" in registrations
+            assert "worktree " + str(unrelated_missing_path) + "\n" in registrations
+            metadata["head"]["ref"] = recovered_branch
+            helper.open_pr("https://github.com/example/repo/pull/4107", str(self.repo), focus=False)
+            listed = self.api("worktree", "list", "--cwd", str(self.repo))["worktrees"]
+            matching = [tree for tree in listed if tree["branch"] == recovered_branch]
+            assert len(matching) == 1, matching
+            recovered_path = Path(matching[0]["path"])
+            assert recovered_path.is_relative_to(self.root / "worktrees")
+            assert recovered_path != missing_path
+            assert self.git_run("symbolic-ref", "--short", "HEAD", cwd=recovered_path) == recovered_branch
+            assert self.git_run("rev-parse", "HEAD", cwd=recovered_path) == self.sha
+            registrations = self.git_run("worktree", "list", "--porcelain")
+            assert "worktree " + str(missing_path) + "\n" not in registrations
+            assert "worktree " + str(unrelated_missing_path) + "\n" in registrations
+            spaces = self.api("workspace", "list")["workspaces"]
+            recovered = next(w for w in spaces
+                             if (w.get("worktree") or {}).get("checkout_path") == str(recovered_path))
+            assert recovered["worktree"]["repo_key"] == parent["worktree"]["repo_key"]
+            assert recovered["worktree"]["is_linked_worktree"] and not recovered["focused"]
+            assert self.api("api", "snapshot")["snapshot"]["focused_workspace_id"] == child["workspace_id"]
+
             metadata["head"]["ref"] = branch
             advanced = self.git_run("commit-tree", self.tree, "-p", self.sha, "-m", "local change", cwd=path)
             self.git_run("update-ref", "refs/heads/" + branch, advanced, cwd=path)
@@ -262,6 +295,7 @@ class Fixture:
             assert not self.git_run("status", "--porcelain")
             assert not self.git_run("for-each-ref", "refs/herdr/pr-worktree")
         print("PASS: cross-space discovery, linked-source create, correct group, dirty linked checkout reuse")
+        print("PASS: deleted temporary checkout recovered, unrelated stale registration and focus preserved")
 
     def stop(self):
         if self.process.poll() is None:

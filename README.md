@@ -56,10 +56,22 @@ the repository's parent space.
 - If the branch exists locally without a worktree and has different commits,
   the plugin reports the conflict. Update or rename that branch before retrying.
 - Existing upstream settings are preserved. New branches have no upstream.
-- A missing or stale checkout registration is reported for repair.
+- A missing, unlocked linked checkout is recreated in Herdr's worktree directory
+  when its parent directory is accessible, its branch matches the fetched PR head,
+  and its retained Git index is clean. The plugin backs up its Git metadata under
+  `herdr-pr-worktree-recovery/` in the repository's common Git directory before
+  removing that one stale registration. Other worktrees are left alone.
+- Locked checkouts, staged changes, interrupted Git operations, and unavailable
+  parent directories require manual repair. Local branch commits are never reset.
 
 The plugin does not clone repositories, change remotes, switch the original
-checkout's branch, or automatically clean up worktrees. It runs only when invoked.
+checkout's branch, or clean up unrelated worktrees. It runs only when invoked.
+
+Remove temporary checkouts with `git worktree remove /path/to/checkout`. Use
+`git worktree move` to relocate a checkout, or run `git worktree repair` from its
+new location after a manual move. Lock checkouts on removable or network storage
+with `git worktree lock /path/to/checkout` before disconnecting them. See the
+[Git worktree documentation](https://git-scm.com/docs/git-worktree).
 
 URLs may include `/files`, `/commits`, `/checks`, a query, or a fragment.
 GitHub Enterprise hosts and SSH host aliases are not supported.
