@@ -55,7 +55,14 @@ the repository's parent space.
   PRs from forks. Herdr manages its location and sidebar grouping.
 - If the branch exists locally without a worktree and has different commits,
   the plugin reports the conflict. Update or rename that branch before retrying.
-- Existing upstream settings are preserved. New branches have no upstream.
+- Branches without tracking settings pull from the PR's source branch. Existing
+  tracking settings are preserved, and reopening a worktree fills in missing
+  tracking without fetching or changing local commits or files.
+- Fork PRs use a matching existing remote, or the fork's GitHub URL with the
+  base remote's HTTPS or SSH transport. URL-based tracking supports `git pull`
+  without adding a named remote; it does not create a remote-tracking ref for
+  ahead/behind counts. If the source repository was deleted, pulls use the base
+  repository's PR head ref.
 - A missing, unlocked linked checkout is recreated in Herdr's worktree directory
   when its parent directory is accessible, its branch matches the fetched PR head,
   and its retained Git index is clean. The plugin backs up its Git metadata under

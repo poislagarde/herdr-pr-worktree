@@ -35,6 +35,7 @@ class CheckoutTests(unittest.TestCase):
         self.workspaces = []
         self.panes = {}
         self.remote_urls = {"origin": "git@github.com:example/project.git"}
+        self.local_remotes = {str(self.remote)}
         self.git_environment = {key: value for key, value in os.environ.items()
                                 if not key.startswith("GIT_")}
         self.git_environment.update({"GIT_CONFIG_NOSYSTEM": "1",
@@ -145,7 +146,7 @@ class CheckoutTests(unittest.TestCase):
                 "worktree": {"path": str(self.checkout)}}})
         if args[:3] == ("git", "remote", "get-url"):
             actual = self.real_run(*args, cwd=cwd, check=check, **kwargs)
-            if actual.stdout.strip() == str(self.remote):
+            if actual.stdout.strip() in self.local_remotes:
                 return subprocess.CompletedProcess(args, 0, self.remote_urls[args[-1]] + "\n", "")
             return actual
         return self.real_run(*args, cwd=cwd, check=check, **kwargs)
@@ -169,6 +170,39 @@ class CheckoutTests(unittest.TestCase):
         refs = self.git("for-each-ref", "--format=%(refname)",
                         "refs/herdr/pr-worktree/").stdout
         self.assertEqual(refs, "")
+
+    def assert_tracking(self, remote, merge=None):
+        self.assertEqual(self.git("config", "--get", "branch." + self.branch + ".remote",
+                                  cwd=self.checkout).stdout.strip(), remote)
+        self.assertEqual(self.git("config", "--get", "branch." + self.branch + ".merge",
+                                  cwd=self.checkout).stdout.strip(),
+                         merge or "refs/heads/" + self.branch)
+
+    def advance_remote(self, remote, target=None):
+        upstream = self.directory / "upstream contributor"
+        self.git("worktree", "add", "--detach", str(upstream), self.pr_sha)
+        (upstream / "tracked.txt").write_text("updated PR head\n")
+        self.git("commit", "-am", "update PR head", cwd=upstream)
+        expected = self.git("rev-parse", "HEAD", cwd=upstream).stdout.strip()
+        self.git("push", str(remote), "HEAD:" + (target or "refs/heads/" + self.branch),
+                 cwd=upstream)
+        return expected
+
+    def assert_pull_reaches(self, expected):
+        pulled = self.git("pull", "--rebase", cwd=self.checkout, check=False)
+        self.assertEqual(pulled.returncode, 0, pulled.stderr)
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.checkout).stdout.strip(),
+                         expected)
+
+    def prepare_fork(self):
+        fork = self.directory / "fork repo.git"
+        self.git("init", "--bare", str(fork), cwd=self.directory)
+        self.git("push", str(fork), self.pr_sha + ":refs/heads/" + self.branch)
+        self.local_remotes.add(str(fork))
+        self.metadata["head"]["repo"]["full_name"] = "contributor/project"
+        # A matching branch name in the base repository must not select that remote.
+        self.git("update-ref", "refs/heads/" + self.branch, self.base_sha, cwd=self.remote)
+        return fork
 
     def recovery_checkout(self, path=None, branch=None):
         path = path or self.directory / "expired temporary checkout"
@@ -218,6 +252,78 @@ class CheckoutTests(unittest.TestCase):
         self.assertIn("--no-focus", creation)
         self.assert_private_refs_removed()
 
+    def test_new_branch_can_pull_without_explicit_remote_or_branch(self):
+        self.open_pr()
+        self.assert_tracking("origin")
+        self.assert_pull_reaches(self.advance_remote(self.remote))
+
+    def test_fork_pr_tracks_existing_head_remote_and_pulls_its_branch(self):
+        fork = self.prepare_fork()
+        self.git("remote", "add", "contributor", str(fork))
+        self.remote_urls["contributor"] = "https://github.com/contributor/project.git"
+        self.open_pr()
+        self.assert_tracking("contributor")
+        self.assert_pull_reaches(self.advance_remote(fork))
+
+    def assert_unconfigured_fork_can_pull(self, base_url, fork_url):
+        fork = self.prepare_fork()
+        self.remote_urls["origin"] = base_url
+        self.git("config", "url." + str(fork) + ".insteadOf", fork_url)
+        remotes = self.git("config", "--get-regexp", r"^remote\.").stdout
+        self.open_pr()
+        self.assert_tracking(fork_url)
+        self.assertEqual(self.git("config", "--get-regexp", r"^remote\.").stdout, remotes)
+        self.assert_pull_reaches(self.advance_remote(fork))
+
+    def test_unconfigured_fork_tracks_ssh_url_and_pulls(self):
+        self.assert_unconfigured_fork_can_pull(
+            "git@github.com:example/project.git", "git@github.com:contributor/project.git")
+
+    def test_unconfigured_fork_tracks_https_url_and_pulls(self):
+        self.assert_unconfigured_fork_can_pull(
+            "https://github.com/example/project.git", "https://github.com/contributor/project.git")
+
+    def test_deleted_head_repository_tracks_base_pull_ref(self):
+        self.metadata["head"]["repo"] = None
+        self.git("update-ref", "-d", "refs/heads/" + self.branch, cwd=self.remote)
+        self.open_pr()
+        self.assert_tracking("origin", "refs/pull/4105/head")
+        self.assert_pull_reaches(self.advance_remote(self.remote, "refs/pull/4105/head"))
+
+    def test_narrow_fetch_configuration_is_preserved_and_pull_works(self):
+        refspec = "+refs/heads/main:refs/remotes/origin/main"
+        self.git("config", "remote.origin.fetch", refspec)
+        self.open_pr()
+        self.assert_tracking("origin")
+        self.assertEqual(self.git("config", "--get-all", "remote.origin.fetch").stdout.strip(),
+                         refspec)
+        self.assert_pull_reaches(self.advance_remote(self.remote))
+
+    def test_origin_preferred_when_multiple_remotes_match_head_repository(self):
+        self.git("remote", "add", "alternate", str(self.remote))
+        self.remote_urls["alternate"] = "https://github.com/example/project.git"
+        self.open_pr()
+        self.assert_tracking("origin")
+
+    def test_existing_tracking_configuration_is_preserved_when_reopened(self):
+        self.git("worktree", "add", "-b", self.branch, str(self.checkout), self.pr_sha)
+        configurations = (
+            {"remote": "origin", "merge": "refs/heads/main"},
+            {"remote": "removed-remote", "merge": "refs/heads/deleted-branch"},
+            {"remote": "removed-remote"},
+            {"merge": "refs/heads/deleted-branch"},
+        )
+        for configuration in configurations:
+            with self.subTest(configuration=configuration):
+                self.git("config", "--remove-section", "branch." + self.branch, check=False)
+                for key, value in configuration.items():
+                    self.git("config", "branch." + self.branch + "." + key, value)
+                before = self.git("config", "--local", "--list").stdout
+                self.calls.clear()
+                self.open_pr()
+                self.assertEqual(self.git("config", "--local", "--list").stdout, before)
+                self.assertFalse(any(call[:2] == ("git", "fetch") for call in self.calls))
+
     def test_fork_pr_without_source_branch_in_base_remote(self):
         self.git("update-ref", "-d", "refs/heads/" + self.branch, cwd=self.remote)
         self.metadata["head"]["repo"]["full_name"] = "contributor/project"
@@ -258,6 +364,7 @@ class CheckoutTests(unittest.TestCase):
         self.assertEqual((self.checkout / "untracked.txt").read_text(), "preserve me\n")
         self.assertFalse(any(call[:2] == ("git", "fetch") for call in self.calls))
         self.assertEqual(len(self.registered_worktrees()), 2)
+        self.assert_tracking("origin")
         self.assert_private_refs_removed()
 
     def test_matching_upstream_remote_is_used(self):
@@ -268,6 +375,7 @@ class CheckoutTests(unittest.TestCase):
         fetch = next(call for call in self.calls if call[:2] == ("git", "fetch"))
         self.assertIn("upstream", fetch)
         self.assertNotIn("origin", fetch)
+        self.assert_tracking("upstream")
 
     def test_unrelated_repository_rejected_before_github_or_fetch(self):
         self.remote_urls["origin"] = "git@github.com:unrelated/project.git"
@@ -619,6 +727,7 @@ class CheckoutTests(unittest.TestCase):
                          self.pr_sha)
         self.assertEqual(self.git("symbolic-ref", "--short", "HEAD",
                                   cwd=self.checkout).stdout.strip(), self.branch)
+        self.assert_tracking("origin")
         self.assert_private_refs_removed()
 
     def test_missing_pull_ref_does_not_create_worktree(self):

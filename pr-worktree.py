@@ -108,7 +108,41 @@ def find_repository(repository, cwd, herdr):
                         "Open that repository in a herdr space, then retry.")
 
 
-def report_opened(response, branch, sha=None):
+def ensure_upstream(root, branch, head_repo, base_remote, number):
+    """Supply pull defaults without replacing any existing tracking settings."""
+    for key in ("remote", "merge"):
+        configured = run("git", "config", "--get", f"branch.{branch}.{key}",
+                         cwd=root, check=False)
+        if configured.returncode == 0:
+            return
+        if configured.returncode != 1:
+            raise WorktreeError(configured.stderr.strip() or "Unable to read branch tracking settings.")
+
+    remote = base_remote
+    merge = f"refs/pull/{number}/head"
+    if head_repo is not None:
+        repository = head_repo["full_name"]
+        if (not isinstance(repository, str)
+                or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository)
+                or any(part in (".", "..") for part in repository.split("/"))):
+            raise WorktreeError("GitHub returned an invalid PR head repository.")
+        matches = [name for name in run("git", "remote", cwd=root).stdout.splitlines()
+                   if github_repo(run("git", "remote", "get-url", name,
+                                      cwd=root).stdout.strip()) == repository.lower()]
+        if matches:
+            remote = "origin" if "origin" in matches else matches[0]
+        else:
+            # A URL remote supports fork pulls without adding a named remote.
+            base_url = run("git", "remote", "get-url", base_remote, cwd=root).stdout.strip()
+            remote = (f"https://github.com/{repository}.git" if base_url.startswith("https://")
+                      else f"git@github.com:{repository}.git")
+        merge = "refs/heads/" + branch
+
+    run("git", "config", f"branch.{branch}.remote", remote, cwd=root)
+    run("git", "config", f"branch.{branch}.merge", merge, cwd=root)
+
+
+def finish_open(response, branch, head_repo, base_remote, number, sha=None):
     result = json.loads(response.stdout)["result"]
     path = result["worktree"]["path"]
     actual_branch = run("git", "symbolic-ref", "--quiet", "HEAD", cwd=path).stdout.strip()
@@ -116,6 +150,7 @@ def report_opened(response, branch, sha=None):
     if actual_branch != "refs/heads/" + branch or (sha is not None and actual_sha != sha):
         raise WorktreeError(f"The branch changed while opening {path}. "
                             "Inspect that checkout before working; it has been left unchanged.")
+    ensure_upstream(path, branch, head_repo, base_remote, number)
     print(f"Opened {branch}\n{path}")
 
 
@@ -229,7 +264,7 @@ def open_pr(url, cwd, focus=True):
     if existing and not missing:
         response = run(herdr, "worktree", "open", "--cwd", source_root,
                        "--path", existing["path"], focus_flag)
-        report_opened(response, branch)
+        finish_open(response, branch, pr["head"].get("repo"), remote, number)
         return
     print(f"Fetching PR #{number}: {branch} …", flush=True)
     # A unique ref avoids FETCH_HEAD races and works for fork PRs too.
@@ -253,7 +288,7 @@ def open_pr(url, cwd, focus=True):
             recover_missing_worktree(root, existing["path"], branch, sha)
         response = run(herdr, "worktree", "create", "--cwd", source_root,
                        "--branch", branch, "--base", sha, focus_flag)
-        report_opened(response, branch, sha)
+        finish_open(response, branch, pr["head"].get("repo"), remote, number, sha)
     finally:
         if fetched:
             run("git", "update-ref", "-d", fetch_ref, fetched, cwd=root, check=False)
