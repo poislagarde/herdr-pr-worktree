@@ -53,8 +53,9 @@ the repository's parent space.
   not fetch, reset, or change its files or commits.
 - A new worktree uses the PR's actual head branch name and commit, including
   PRs from forks. Herdr manages its location and sidebar grouping.
-- If the branch exists locally without a worktree and has different commits,
-  the plugin reports the conflict. Update or rename that branch before retrying.
+- If the branch exists locally without a worktree and is behind the PR head,
+  it is fast-forwarded. A branch with commits that are not in the PR is reported
+  and left unchanged; push, rebase, or rename it before retrying.
 - Branches without tracking settings pull from the PR's source branch. Existing
   tracking settings are preserved, and reopening a worktree fills in missing
   tracking without fetching or changing local commits or files.
@@ -64,8 +65,9 @@ the repository's parent space.
   ahead/behind counts. If the source repository was deleted, pulls use the base
   repository's PR head ref.
 - A missing, unlocked linked checkout is recreated in Herdr's worktree directory
-  when its parent directory is accessible, its branch matches the fetched PR head,
-  and its retained Git index is clean. The plugin backs up its Git metadata under
+  when its parent directory is accessible, its branch has no commits beyond the
+  fetched PR head, and its retained Git index is clean. The branch is then
+  fast-forwarded if needed. The plugin backs up its Git metadata under
   `herdr-pr-worktree-recovery/` in the repository's common Git directory before
   removing that one stale registration. Other worktrees are left alone.
 - Locked checkouts, staged changes, interrupted Git operations, and unavailable

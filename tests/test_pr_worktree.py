@@ -204,9 +204,9 @@ class CheckoutTests(unittest.TestCase):
         self.git("update-ref", "refs/heads/" + self.branch, self.base_sha, cwd=self.remote)
         return fork
 
-    def recovery_checkout(self, path=None, branch=None):
+    def recovery_checkout(self, path=None, branch=None, sha=None):
         path = path or self.directory / "expired temporary checkout"
-        self.git("worktree", "add", "-b", branch or self.branch, str(path), self.pr_sha)
+        self.git("worktree", "add", "-b", branch or self.branch, str(path), sha or self.pr_sha)
         admin = Path(self.git("rev-parse", "--absolute-git-dir", cwd=path).stdout.strip())
         return path, admin
 
@@ -471,13 +471,48 @@ class CheckoutTests(unittest.TestCase):
         self.assertFalse(any(call[:2] == ("git", "fetch") for call in self.calls))
         self.assert_no_checkout_created()
 
+    def local_only_commit(self):
+        tree = self.git("rev-parse", self.base_sha + "^{tree}").stdout.strip()
+        return self.git("commit-tree", tree, "-p", self.base_sha,
+                        "-m", "local only").stdout.strip()
+
     def test_different_local_branch_commits_are_preserved(self):
-        self.git("branch", self.branch, self.base_sha)
+        local = self.local_only_commit()
+        self.git("branch", self.branch, local)
         with self.assertRaises(HELPER.WorktreeError):
             self.open_pr()
-        self.assertEqual(self.git("rev-parse", "refs/heads/" + self.branch).stdout.strip(),
-                         self.base_sha)
+        self.assertEqual(self.git("rev-parse", "refs/heads/" + self.branch).stdout.strip(), local)
         self.assert_no_checkout_created()
+
+    def test_local_branch_behind_pr_is_fast_forwarded(self):
+        self.git("branch", self.branch, self.base_sha)
+        self.open_pr()
+        self.assertEqual(self.git("rev-parse", "refs/heads/" + self.branch).stdout.strip(),
+                         self.pr_sha)
+        self.assertEqual(self.git("symbolic-ref", "--short", "HEAD",
+                                  cwd=self.checkout).stdout.strip(), self.branch)
+        self.assertEqual(self.git("status", "--porcelain", cwd=self.checkout).stdout, "")
+        self.assert_private_refs_removed()
+
+    def test_missing_checkout_behind_pr_is_recovered_and_fast_forwarded(self):
+        missing, admin = self.recovery_checkout(sha=self.base_sha)
+        shutil.rmtree(missing)
+        self.open_pr()
+        self.assertFalse(admin.exists())
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.checkout).stdout.strip(),
+                         self.pr_sha)
+        self.assertEqual(self.git("symbolic-ref", "--short", "HEAD",
+                                  cwd=self.checkout).stdout.strip(), self.branch)
+        self.assertEqual(self.git("status", "--porcelain", cwd=self.checkout).stdout, "")
+        self.assertEqual(len(list((self.root / ".git" / "herdr-pr-worktree-recovery")
+                                  .iterdir())), 1)
+        self.assert_private_refs_removed()
+
+    def test_missing_checkout_with_local_only_commits_is_preserved(self):
+        local = self.local_only_commit()
+        missing, admin = self.recovery_checkout(sha=local)
+        shutil.rmtree(missing)
+        self.assert_recovery_refused(missing, admin, local)
 
     def test_matching_checkout_reopened_with_dirty_edits_intact(self):
         self.git("worktree", "add", "-b", self.branch, str(self.checkout), self.pr_sha)

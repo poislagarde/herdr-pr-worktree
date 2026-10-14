@@ -166,7 +166,7 @@ def invocation_cwd():
     return os.environ.get("HERDR_ACTIVE_PANE_CWD") or os.getcwd()
 
 
-def recover_missing_worktree(root, path, branch, sha):
+def recover_missing_worktree(root, path, branch, tip):
     """Remove only a confirmed stale registration, retaining its metadata."""
     path = Path(path)
     hint = (f"The checkout for '{branch}' needs repair: {path}. "
@@ -196,7 +196,7 @@ def recover_missing_worktree(root, path, branch, sha):
         matching = [entry for entry in trees if entry.get("worktree") == str(path)]
         if (len(matching) != 1 or matching[0] is trees[0]
                 or matching[0].get("branch") != "refs/heads/" + branch
-                or matching[0].get("HEAD") != sha
+                or matching[0].get("HEAD") != tip
                 or "locked" in matching[0] or "prunable" not in matching[0]):
             raise WorktreeError(hint)
 
@@ -281,11 +281,17 @@ def open_pr(url, cwd, focus=True):
                    "refs/heads/" + branch, cwd=root).stdout.splitlines()
         local = next((line.split(" ", 1)[1] for line in refs
                       if line.startswith("refs/heads/" + branch + " ")), None)
-        if local is not None and local != sha:
-            raise WorktreeError(f"Local branch '{branch}' has different commits from PR #{number}. "
-                                "Update or rename it, then retry. It has been left unchanged.")
+        behind = local is not None and local != sha
+        if behind and run("git", "merge-base", "--is-ancestor", local, sha,
+                          cwd=root, check=False).returncode:
+            raise WorktreeError(f"Local branch '{branch}' has commits that are not in PR #{number}. "
+                                "Push, rebase, or rename it, then retry. It has been left unchanged.")
         if missing:
-            recover_missing_worktree(root, existing["path"], branch, sha)
+            recover_missing_worktree(root, existing["path"], branch, local)
+        if behind:
+            # The old-value guard refuses if the branch moved since it was checked.
+            run("git", "update-ref", "refs/heads/" + branch, sha, local, cwd=root)
+            print(f"Fast-forwarded {branch} to the PR head", flush=True)
         response = run(herdr, "worktree", "create", "--cwd", source_root,
                        "--branch", branch, "--base", sha, focus_flag)
         finish_open(response, branch, pr["head"].get("repo"), remote, number, sha)
