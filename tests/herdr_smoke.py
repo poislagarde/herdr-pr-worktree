@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check the real plugin popup and worktree contract in a private headless server.
 
-Requires Python 3.9+, Git, and Herdr 0.9.0+. No live session, browser, GitHub
+Requires Python 3.11+, Git, and Herdr 0.9.0+. No live session, browser, GitHub
 account, or network Git remote is used. All runtime state lives under /tmp.
 """
 

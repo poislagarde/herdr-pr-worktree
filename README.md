@@ -5,7 +5,7 @@ repository's existing Herdr space. Run the action from any space: the plugin
 finds the matching open repository. Existing worktrees are reused with their
 local commits and uncommitted changes intact.
 
-Requires Herdr 0.9.0+, Python 3.9+, Git, and authenticated GitHub CLI (`gh`) on
+Requires Herdr 0.9.0+, Python 3.11+, Git, and authenticated GitHub CLI (`gh`) on
 macOS or Linux. No Python packages or build step are needed.
 
 ## Install
